@@ -1,5 +1,6 @@
-torch>=2.0.0
-transformers>=4.40.0
-triton>=2.2.0
-ninja
-accelerate
+torch>=2.7.0
+transformers>=4.51.0
+huggingface_hub>=0.30.0
+safetensors>=0.4.0
+pipecat-ai[deepgram,openai,local]>=0.0.50
+numpy>=1.26.0
