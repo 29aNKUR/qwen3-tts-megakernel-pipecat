@@ -34,7 +34,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService
+from pipecat.services.groq import GroqLLMService
 from pipecat.transports.local.audio import LocalAudioTransport
 from pipecat.transports.local.audio import LocalAudioTransportParams
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
@@ -79,18 +79,18 @@ async def run_pipeline(text_only: bool = False):
 
     # --- Set up Pipecat services ---
     deepgram_key = os.environ.get("DEEPGRAM_API_KEY")
-    openai_key = os.environ.get("OPENAI_API_KEY")
+    groq_key = os.environ.get("GROQ_API_KEY")
 
     if not deepgram_key:
         raise ValueError("Set DEEPGRAM_API_KEY environment variable")
-    if not openai_key:
-        raise ValueError("Set OPENAI_API_KEY environment variable")
+    if not groq_key:
+        raise ValueError("Set GROQ_API_KEY environment variable")
 
     stt = DeepgramSTTService(api_key=deepgram_key)
 
-    llm = OpenAILLMService(
-        api_key=openai_key,
-        model="gpt-4o-mini",  # fast and cheap for demo
+    llm = GroqLLMService(
+        api_key=groq_key,
+        model="llama-3.3-70b-versatile",  # fast and free
     )
 
     tts = MegakernelTTSService(
