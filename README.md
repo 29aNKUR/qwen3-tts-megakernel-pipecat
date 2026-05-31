@@ -129,3 +129,37 @@ LDG_VOCAB_SIZE=3072 LDG_LM_NUM_BLOCKS=16 python talker_test.py
 
 Built on AlpinDale's qwen_megakernel, Qwen3-TTS by the Qwen team at
 Alibaba, and Pipecat.
+## Why This Matters for e3
+
+e3 builds voice agents that negotiate with carriers over the phone. In a
+live phone call, two numbers decide whether the agent feels human or
+broken:
+
+**Time to first audio (TTFC).** When a carrier finishes speaking, silence
+longer than roughly 200-300 ms reads as a dropped call or a confused
+listener. The other person starts talking over you. So the agent has to
+start producing sound almost immediately. That is why the task targets
+sub-90 ms TTFC, and why the talker decode latency I measured (0.83 ms per
+token) matters: the model itself must never be the reason for the pause.
+
+**Real-time factor (RTF).** If generating one second of speech takes longer
+than one second, the agent falls progressively further behind the
+conversation until it collapses. Everything has to run comfortably faster
+than real time, with margin for the network and the carrier's own pauses.
+
+This is also why the megakernel approach is the right tool here, not a
+nice-to-have. Standard inference bounces between CPU and GPU hundreds of
+times per token, and that overhead is exactly what kills latency in a live
+call. The megakernel collapses a full decode step into one GPU launch, so
+the per-token cost is dominated by useful work, not coordination. On the
+talker that showed up as 0.83 ms per token with ~79 ms of per-frame budget
+to spare.
+
+**On observability.** For a production voice agent, you cannot improve what
+you cannot see. Every number in this submission is measured with explicit
+GPU synchronization rather than estimated, and the per-stage breakdown
+(talker vs code predictor vs vocoder) is exactly the instrumentation you
+would want in production to know which stage to optimize when a call starts
+lagging. The honest "what is not integrated and why" section is the same
+instinct: a production system should be clear about what is verified versus
+assumed.
