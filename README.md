@@ -1,5 +1,7 @@
 # Realtime TTS Pipeline: Qwen3-TTS on the RTX 5090 Decode Megakernel
 
+
+**Demo video:** https://drive.google.com/file/d/1aRTmX_aqlZ8zAm6z2jQc27daLTvOVpOa/view?usp=sharing
 Running AlpinDale's Qwen3 decode megakernel as the LLM backend for the
 Qwen3-TTS talker decoder, with a streaming inference server and Pipecat
 voice-pipeline integration.
