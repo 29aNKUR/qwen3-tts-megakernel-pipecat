@@ -1,30 +1,51 @@
 """
-Weight loading for Qwen3-TTS talker decoder and code predictor.
+Weight loading for Qwen3-TTS-12Hz-0.6B-Base.
 
-The Qwen3-TTS talker decoder is architecturally identical to Qwen3-0.6B:
-  - Same hidden size: 1024
-  - Same 28 layers
-  - Same 16 query heads, 8 KV heads, head dim 128
-  - Different vocab: 3072 audio codes (not 151936 text tokens)
-  - Different RoPE frequency: 1,000,000 (not 10,000)
-  - Untied output embeddings (separate lm_head weight)
+Verified against the actual model structure:
 
-The code predictor is the same architecture but only 5 layers.
-We run both through the same compiled megakernel by swapping weights
-and passing num_layers=5 for the code predictor.
+TALKER (28 layers, backbone identical to Qwen3-0.6B):
+  talker.model.layers.{i}.input_layernorm.weight        (1024,)
+  talker.model.layers.{i}.self_attn.q_proj.weight       (2048, 1024)
+  talker.model.layers.{i}.self_attn.k_proj.weight       (1024, 1024)
+  talker.model.layers.{i}.self_attn.v_proj.weight       (1024, 1024)
+  talker.model.layers.{i}.self_attn.q_norm.weight       (128,)
+  talker.model.layers.{i}.self_attn.k_norm.weight       (128,)
+  talker.model.layers.{i}.self_attn.o_proj.weight       (1024, 2048)
+  talker.model.layers.{i}.post_attention_layernorm.weight (1024,)
+  talker.model.layers.{i}.mlp.gate_proj.weight          (3072, 1024)
+  talker.model.layers.{i}.mlp.up_proj.weight            (3072, 1024)
+  talker.model.layers.{i}.mlp.down_proj.weight          (1024, 3072)
+  talker.model.codec_embedding.weight                   (3072, 1024)  audio code input
+  talker.model.text_embedding.weight                    (151936, 2048) text input
+  talker.model.norm.weight                              (1024,)
+  talker.codec_head.weight                              (3072, 1024)  output head
+
+CODE PREDICTOR (5 layers, same backbone shape):
+  talker.code_predictor.model.layers.{i}.*              (same structure)
+  talker.code_predictor.model.codec_embedding.{g}.weight (2048, 1024) per group g=0..14
+  talker.code_predictor.lm_head.{g}.weight              (2048, 1024)  per group g=0..14
+
+So the talker emits codebook 0 (vocab 3072). The code predictor emits
+codebooks 1..15 (vocab 2048 each), with a separate embedding + head per group.
+Both backbones are byte-for-byte compatible with the megakernel layer format.
 """
 
 import struct
+import glob
+import os
 import torch
+from safetensors.torch import load_file
 
-# --- Talker decoder constants ---
+# --- Talker constants ---
 TALKER_NUM_LAYERS = 28
-TALKER_VOCAB_SIZE = 3072
+TALKER_VOCAB_SIZE = 3072        # codec_head output
 
 # --- Code predictor constants ---
 PREDICTOR_NUM_LAYERS = 5
+PREDICTOR_VOCAB_SIZE = 2048      # each lm_head output
+NUM_PREDICTOR_GROUPS = 15        # codebooks 1..15
 
-# --- Shared architecture constants (same for both) ---
+# --- Shared architecture (talker and predictor identical) ---
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 HIDDEN_SIZE = 1024
@@ -34,15 +55,14 @@ Q_SIZE = NUM_Q_HEADS * HEAD_DIM   # 2048
 KV_SIZE = NUM_KV_HEADS * HEAD_DIM  # 1024
 MAX_SEQ_LEN = 2048
 
-# RoPE frequency for TTS (different from text model's 10000)
+# Total codebooks per frame: 1 talker + 15 predictor
+NUM_CODEBOOKS = 16
+
+# RoPE frequency. Qwen3 uses 1,000,000 for the 0.6B family.
 ROPE_THETA = 1_000_000.0
 
-# Number of codebook groups Qwen3-TTS uses
-NUM_CODEBOOKS = 16  # 1 from talker + 15 from code predictor
 
-
-def _build_rope_tables(max_seq_len: int = MAX_SEQ_LEN, theta: float = ROPE_THETA):
-    """Build cos/sin RoPE tables for the given theta frequency."""
+def _build_rope_tables(max_seq_len=MAX_SEQ_LEN, theta=ROPE_THETA):
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     )
@@ -53,11 +73,8 @@ def _build_rope_tables(max_seq_len: int = MAX_SEQ_LEN, theta: float = ROPE_THETA
     return cos_table, sin_table
 
 
-def _extract_layer_weights(state: dict, prefix: str, num_layers: int) -> list:
-    """
-    Extract the 11 weight tensors per layer that the megakernel expects.
-    Returns a flat list: [layer0_w0, layer0_w1, ..., layer0_w10, layer1_w0, ...]
-    """
+def _extract_layer_weights(state, prefix, num_layers):
+    """Pull the 11 tensors per layer in the exact order the kernel expects."""
     layer_weights = []
     for i in range(num_layers):
         p = f"{prefix}{i}."
@@ -77,16 +94,11 @@ def _extract_layer_weights(state: dict, prefix: str, num_layers: int) -> list:
     return layer_weights
 
 
-def pack_layer_weights(layer_weights: list, num_layers: int) -> torch.Tensor:
-    """
-    Pack the flat layer weight list into a GPU blob of LDGLayerWeights structs.
-    This is the same packing format the original megakernel expects.
-    Each struct is 11 x 8-byte pointers = 88 bytes.
-    """
+def pack_layer_weights(layer_weights, num_layers):
+    """Pack into the LDGLayerWeights struct blob (11 x 8-byte pointers per layer)."""
     ptr_size = 8
     n_ptrs = 11
-    struct_bytes = n_ptrs * ptr_size
-    buf = bytearray(num_layers * struct_bytes)
+    buf = bytearray(num_layers * n_ptrs * ptr_size)
     for i in range(num_layers):
         for j in range(n_ptrs):
             ptr = layer_weights[i * n_ptrs + j].data_ptr()
@@ -94,98 +106,99 @@ def pack_layer_weights(layer_weights: list, num_layers: int) -> torch.Tensor:
     return torch.frombuffer(buf, dtype=torch.uint8).cuda()
 
 
-def load_tts_weights(model_name: str = "Qwen/Qwen3-TTS", verbose: bool = True):
+def load_tts_weights(model_dir="./qwen3-tts-model", verbose=True):
     """
-    Load Qwen3-TTS weights from HuggingFace.
+    Load Qwen3-TTS-12Hz-0.6B-Base weights into GPU tensors.
 
-    Returns a dict with everything both the talker and code predictor need.
-    We load the full model once, extract weights for both sub-models, then
-    delete the HuggingFace model to free CPU memory.
+    model_dir is the local directory the model was downloaded to.
     """
     if verbose:
-        print(f"Loading {model_name} from HuggingFace...")
+        print(f"Loading weights from {model_dir}...")
 
-    # We load the modeling file directly since Qwen3-TTS uses a custom
-    # generation script (modeling_qwen3_tts.py) not the standard AutoModel
-    from transformers import AutoProcessor
-    import os
+    shard_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if not shard_files:
+        raise FileNotFoundError(f"No safetensors found in {model_dir}")
 
-    # Download model files
-    from huggingface_hub import snapshot_download
-    model_path = snapshot_download(model_name)
-
-    if verbose:
-        print(f"Model downloaded to: {model_path}")
-        print("Loading weights into GPU tensors...")
-
-    # Load safetensors directly for efficiency
-    from safetensors.torch import load_file
-    import glob
-
-    shard_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
     state = {}
     for shard in shard_files:
         state.update(load_file(shard, device="cuda"))
 
-    if verbose:
-        print(f"Loaded {len(state)} weight tensors")
+    # Convert everything to bfloat16 (model may ship some fp32)
+    for k in list(state.keys()):
+        if state[k].dtype == torch.float32:
+            state[k] = state[k].to(torch.bfloat16)
 
-    # Build RoPE tables (TTS uses theta=1,000,000 not 10,000)
+    if verbose:
+        print(f"Loaded {len(state)} tensors. Building RoPE tables...")
+
     cos_table, sin_table = _build_rope_tables()
 
-    # --- Talker decoder weights ---
-    # The talker uses the same 28-layer Qwen3 backbone
+    # --- Talker backbone ---
     talker_layer_weights = _extract_layer_weights(
         state, "talker.model.layers.", TALKER_NUM_LAYERS
     )
-    talker_embed = state["talker.model.embed_tokens.weight"].contiguous()
-    talker_final_norm = state["talker.model.norm.weight"].contiguous()
-    # Qwen3-TTS has UNTIED lm_head (separate from embed_tokens)
-    talker_lm_head = state["talker.lm_head.weight"].contiguous()
+    talker_codec_embed = state["talker.model.codec_embedding.weight"].contiguous()  # (3072,1024)
+    talker_text_embed = state["talker.model.text_embedding.weight"].contiguous()    # (151936,2048)
+    talker_norm = state["talker.model.norm.weight"].contiguous()
+    talker_head = state["talker.codec_head.weight"].contiguous()                    # (3072,1024)
 
-    # --- Code predictor weights ---
-    # Same architecture, 5 layers instead of 28
-    predictor_layer_weights = _extract_layer_weights(
-        state, "code_predictor.model.layers.", PREDICTOR_NUM_LAYERS
+    # Text projection (projects 2048-dim text embedding down to 1024 hidden)
+    text_proj_fc1_w = state["talker.text_projection.linear_fc1.weight"].contiguous()
+    text_proj_fc1_b = state["talker.text_projection.linear_fc1.bias"].contiguous()
+    text_proj_fc2_w = state["talker.text_projection.linear_fc2.weight"].contiguous()
+    text_proj_fc2_b = state["talker.text_projection.linear_fc2.bias"].contiguous()
+
+    # --- Code predictor backbone ---
+    pred_layer_weights = _extract_layer_weights(
+        state, "talker.code_predictor.model.layers.", PREDICTOR_NUM_LAYERS
     )
-    predictor_embed = state["code_predictor.model.embed_tokens.weight"].contiguous()
-    predictor_final_norm = state["code_predictor.model.norm.weight"].contiguous()
-    predictor_lm_head = state["code_predictor.lm_head.weight"].contiguous()
+    pred_norm = state["talker.code_predictor.model.norm.weight"].contiguous()
 
-    # --- Vocoder weights (kept as HF model for simplicity) ---
-    # The vocoder converts audio codes back to waveforms
-    # We keep this in PyTorch since it is not the bottleneck
-    vocoder_path = os.path.join(model_path, "vocoder")
+    # 15 per-group embeddings and 15 per-group heads
+    pred_codec_embeds = [
+        state[f"talker.code_predictor.model.codec_embedding.{g}.weight"].contiguous()
+        for g in range(NUM_PREDICTOR_GROUPS)
+    ]
+    pred_heads = [
+        state[f"talker.code_predictor.lm_head.{g}.weight"].contiguous()
+        for g in range(NUM_PREDICTOR_GROUPS)
+    ]
 
-    # Pre-pack layer weights into GPU structs the kernel expects
+    # Pack layer weights into kernel struct format
     talker_packed = pack_layer_weights(talker_layer_weights, TALKER_NUM_LAYERS)
-    predictor_packed = pack_layer_weights(predictor_layer_weights, PREDICTOR_NUM_LAYERS)
+    pred_packed = pack_layer_weights(pred_layer_weights, PREDICTOR_NUM_LAYERS)
 
     weights = {
         # Talker
-        "talker_embed": talker_embed,
+        "talker_codec_embed": talker_codec_embed,
+        "talker_text_embed": talker_text_embed,
         "talker_layer_weights": talker_layer_weights,
         "talker_layer_weights_packed": talker_packed,
-        "talker_final_norm": talker_final_norm,
-        "talker_lm_head": talker_lm_head,
+        "talker_norm": talker_norm,
+        "talker_head": talker_head,
+        "text_proj_fc1_w": text_proj_fc1_w,
+        "text_proj_fc1_b": text_proj_fc1_b,
+        "text_proj_fc2_w": text_proj_fc2_w,
+        "text_proj_fc2_b": text_proj_fc2_b,
 
         # Code predictor
-        "predictor_embed": predictor_embed,
-        "predictor_layer_weights": predictor_layer_weights,
-        "predictor_layer_weights_packed": predictor_packed,
-        "predictor_final_norm": predictor_final_norm,
-        "predictor_lm_head": predictor_lm_head,
+        "pred_layer_weights": pred_layer_weights,
+        "pred_layer_weights_packed": pred_packed,
+        "pred_norm": pred_norm,
+        "pred_codec_embeds": pred_codec_embeds,   # list of 15
+        "pred_heads": pred_heads,                 # list of 15
 
-        # Shared RoPE tables
+        # Shared
         "cos_table": cos_table,
         "sin_table": sin_table,
 
-        # Paths for vocoder
-        "model_path": model_path,
-        "vocoder_path": vocoder_path,
+        "model_dir": model_dir,
+        "_state": state,  # keep alive so tensors are not freed
     }
 
     if verbose:
-        print("All weights loaded and packed successfully.")
+        print("Talker: 28 layers, vocab 3072")
+        print("Code predictor: 5 layers, 15 groups, vocab 2048 each")
+        print("All weights packed.")
 
     return weights

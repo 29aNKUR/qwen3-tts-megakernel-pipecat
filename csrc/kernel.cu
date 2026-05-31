@@ -71,7 +71,9 @@ constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
 
 // LM head
-constexpr int LDG_VOCAB_SIZE = 151936;
+#ifndef LDG_VOCAB_SIZE
+#define LDG_VOCAB_SIZE 151936
+#endif
 
 struct LDGLayerWeights {
   const __nv_bfloat16 *input_layernorm_weight;
